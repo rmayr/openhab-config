@@ -1,0 +1,64 @@
+// ATTENTION: Constants to tweak for the local installation
+val GridVoltage = 220
+val MaxAmperage = 16		// the maximum amperage the charger can use (typically the fuse/cable rating, typically 16A)
+val MinAmperage = 6			// the minimum amperage the charger can be set to (e.g. for the Go-eCharger this is 6A)
+val AllowExcessPower = 1000	// allow charging when pulling up to this power (in Watts) from grid
+
+rule "Set maximum current for car charger based on PV feed (compute every 10 minutes)"
+when Time cron "0 */10 * ? * *" or
+	 Item Charging_Solar_Automatic_Override changed
+then
+	// Note: all values averaged over the last 10 minutes to even out spikes in solar generation and other local load
+	val averageSince = now.minusMinutes(10)
+	var currentChargePower = GoECharger_PowerL1.averageSince(averageSince) +
+		GoECharger_PowerL2.averageSince(averageSince) +
+		GoECharger_PowerL3.averageSince(averageSince)
+                
+        if (currentChargePower == null) {
+            logError("Electric power optimization", "Couldn't read 10 min average charging power, assuming it was 0")
+            logInfo("Electric power optimization", "GoECharger_PowerL1=" + GoECharger_PowerL1 + " (avg=" + GoECharger_PowerL1.averageSince(averageSince) + "), GoECharger_PowerL2= " + GoECharger_PowerL2 + "(avg=" + GoECharger_PowerL2.averageSince(averageSince) + "), GoECharger_PowerL3=" + GoECharger_PowerL3 + "(avg=" + GoECharger_PowerL3.averageSince(averageSince) + ")")
+            currentChargePower = 0
+        }
+                
+	// this is the total power available, i.e. current feeding into grid + what we are currently charging into the car
+	// Note: the powerflowchannelpgrid channel for Fronius smart meter is negative when feeding into the grid, positive when pulling,
+	// therefore need to invert here
+	val totalPower = currentChargePower - Solar_Meter_Power_CurrentGridConsumed.averageSince(averageSince)
+	logInfo("Electric power optimization", "Available power for charging: " + (-(Solar_Meter_Power_CurrentGridConsumed.state as Number)) + " (current grid feed, average in last 10 min: " + (-Solar_Meter_Power_CurrentGridConsumed.averageSince(averageSince)) + ") + " + currentChargePower + " (current charge power) = " + totalPower + "W")
+
+	var boolean allow = ON
+	var int current = MinAmperage
+
+	// If the override switch is set, allow charging at maximum amperage 
+	if (Charging_Solar_Automatic_Override.state == ON) {
+		logInfo("Electric power optimization", "Override switch is ON, allowing charging with " + MaxAmperage + "A")
+		allow = ON
+		current = MaxAmperage
+	}
+	else if (totalPower+AllowExcessPower < (MinAmperage)*3*GridVoltage) {
+		logInfo("Electric power optimization", "Not enough surplus power to charge, switching off")
+		allow = OFF
+		current = MinAmperage
+	}
+	else {
+		allow = ON
+		/*logDebug("Electric power optimization", "totalPower=" + totalPower + " / (GridVoltage*3)= " + (GridVoltage*3) + " = " +
+			(totalPower / (GridVoltage*3))) */
+		current = Math::floor((totalPower / (GridVoltage*3) as Number).doubleValue).intValue
+		if (current > MaxAmperage) {
+			logInfo("Electric power optimization", "Power surplus exceeds maximum power for charging, capping to " + current + "A")
+			current = MaxAmperage
+		}
+	}
+
+	// set maxCurrent and allow fields
+	logInfo("Electric power optimization", "Setting charger to allow=" + allow + ", maxCurrent=" + current)
+	GoECharger_MaxCurrent.sendCommand(current)
+	GoECharger_AllowCharging.sendCommand(allow)
+end
+
+rule "Wake up Tesla to trigger charging"
+when Time cron "0 30 7 ? * *"
+then
+	logger.info("Tesla", "Battery level: " + Tesla_BatteryLevel.state + ", charge: " + Tesla_Charge.state)
+end
